@@ -14,6 +14,9 @@
 #include <signal.h>
 #include <time.h>
 
+#define ARP_REQUEST 1
+#define ARP_REPLY 2
+
 struct {
 	u_char dst[6];
 	u_char src[6];
@@ -45,6 +48,9 @@ int sock_arp;
 
 ds_device * devices[256] = {0};
 
+struct ether_addr DUTmac;
+struct in_addr DUTip;
+
 int hash_map(void *addr)
 {
 
@@ -72,14 +78,20 @@ void insert_new_device(int key, ds_device * new)
 	ds_device *dp;
 	dp = devices[key];
 	while (dp) {
-		if (memcmp(&dp->mac, &new->mac, sizeof(struct ether_addr)) == 0)
-				return;
+		if (memcmp(&dp->mac, &new->mac, sizeof(struct ether_addr)) == 0) {
+			memcpy(&dp->ip, &new->ip, sizeof(struct in_addr));
+			memcpy(&dp->update, &new->update, sizeof(long));
+			dp->live = 1;
+			free(new);
+			return;
+		}
 		dp = dp->next;
 	}
 	new->next = devices[key];
 	devices[key] = new;
 	printf("successfully inserted one iterm!\n");
 }
+
 void arp_check()
 {
 	int hval;
@@ -106,26 +118,37 @@ void init_socket()
 {
 	struct sockaddr addr;
 
-
 #define WAN "wlp3s0"
 #if 1
+	struct ifreq ifr;
+	struct sockaddr_ll local_addr;
 
 	sock_arp = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
 	if(sock_arp < 0) {
 		perror("socket");
 		exit(-1);
 	}
-	struct ifreq ifr;
 	strncpy(ifr.ifr_name, WAN, sizeof WAN);
+	/* read the MAC and IP for sending ARP requiest later */
+	if(ioctl(sock_arp, SIOCGIFHWADDR, &ifr) < 0) {
+		perror("ioctl");
+		exit(-1);
+	}
+	memcpy(&DUTmac, ifr.ifr_hwaddr.sa_data, sizeof(struct ether_addr));
+
+	if(ioctl(sock_arp, SIOCGIFADDR, &ifr) < 0) {
+		perror("ioctl");
+		exit(-1);
+	}
+	memcpy(&DUTip, &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr, sizeof(struct in_addr));
+
 	if(ioctl(sock_arp, SIOCGIFINDEX, &ifr) < 0) {
 		perror("ioctl");
 		exit(-1);
 	}
-	struct sockaddr_ll local_addr;
 	memset(&local_addr, 0x00, sizeof(local_addr));
 	local_addr.sll_family = PF_PACKET;
 	local_addr.sll_ifindex = ifr.ifr_ifindex;
-	//local_addr.sll_ifindex = IFF_BROADCAST;
 	local_addr.sll_protocol = htons(ETH_P_ARP);
 	if (bind(sock_arp, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
 		perror("bind");
@@ -170,7 +193,7 @@ void loop_check()
 				perror("recv");
 				exit(-1);
 			}
-			printf("ARP  %s from %s - %s", ntohs(arp.opcode) == 1 ? "request" : "reply", ether_ntoa(&arp.my_mac), inet_ntoa(arp.my_ip));
+			printf("ARP  %s from %s - %s", ntohs(arp.opcode) == ARP_REQUEST ? "request" : "reply", ether_ntoa(&arp.my_mac), inet_ntoa(arp.my_ip));
 			printf(" to %s\n",  inet_ntoa(arp.your_ip));
 
 			arp_check();
@@ -202,17 +225,17 @@ void print_devices(int signal)
 		dp = devices[i];
 		while(dp) {
 
-		count++;
-		if(dp->mod_name[0] != '\0')
-			strncpy(name, dp->mod_name, sizeof(name));
-		else if(dp->ori_name[0] != '\0')
-			strncpy(name, dp->ori_name, sizeof(name));
-		else
-			sprintf(name, "device%d", count);
+			count++;
+			if(dp->mod_name[0] != '\0')
+				strncpy(name, dp->mod_name, sizeof(name));
+			else if(dp->ori_name[0] != '\0')
+				strncpy(name, dp->ori_name, sizeof(name));
+			else
+				sprintf(name, "device%d", count);
 
-		ether_ntoa_r(&dp->mac, mac);
-		strncpy(ip, inet_ntoa(dp->ip), sizeof ip);
-		strncpy(utime, ctime(&dp->update), sizeof utime);
+			ether_ntoa_r(&dp->mac, mac);
+			strncpy(ip, inet_ntoa(dp->ip), sizeof ip);
+			strncpy(utime, ctime(&dp->update), sizeof utime);
 
 			printf("%-16s\t%-18s\t%-16s\t%s\n", name, mac, ip, utime);
 			dp = dp->next;
@@ -221,11 +244,42 @@ void print_devices(int signal)
 	}
 }
 
+void send_arp(ds_device *dp)
+{
+	memcpy(arp.dst, &dp->mac, 6);
+	memcpy(arp.src, &DUTmac, 6);
+	arp.hw_proto = htons(0x806);
+	arp.hw_type = htons(0x01);
+	arp.proto = htons(0x0800);
+	arp.hw_size = 6;
+	arp.proto_size = 4;
+	arp.opcode = htons(ARP_REQUEST);
+	memcpy(&arp.my_mac, &DUTmac, 6);
+	memcpy(&arp.my_ip, &DUTip, 6);
+	memset(&arp.your_mac, 0x00, 6);
+	memcpy(&arp.your_ip, &dp->ip, 6);
+
+	send(sock_arp, &arp, sizeof arp, 0);
+
+}
 #define PID_FILE	"/var/run/devscan.pid"
 void safe_quit(int signal)
 {
 	unlink(PID_FILE);
 	exit(0);
+}
+
+void renew(int signal)
+{
+	int i;
+	ds_device *dp;
+	for (i = 0; i < 256; i++) {
+		dp = devices[i];
+		while (dp) {
+			send_arp(dp);
+			dp = dp->next;
+		}
+	}
 }
 
 int main(int argc, char *argv[])
@@ -266,6 +320,7 @@ int main(int argc, char *argv[])
 
 	if(!duplicate) {
 		signal(SIGUSR1, print_devices);
+		signal(SIGUSR2, renew);
 		signal(SIGTERM, safe_quit);
 	}
 
