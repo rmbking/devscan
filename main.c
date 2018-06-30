@@ -9,6 +9,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <linux/if_packet.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #define ARP_REQUEST 1
 #define ARP_REPLY 2
 
+#define strpnl(str) do { if(strchr(str, '\n')) *strchr(str, '\n') = 0;} while(0)
 struct {
 	u_char dst[6];
 	u_char src[6];
@@ -38,7 +40,8 @@ typedef struct ds_device{
 	struct ether_addr mac;
 	struct in_addr ip;
 	char ori_name[128];
-	char mod_name[128];
+	char mod_name[64];
+	char vendor[64];
 	int live;
 	long update;
 	char *extra_info;
@@ -73,6 +76,89 @@ int hash_map(void *addr)
 
 }
 
+int is_valid_dir(char *dir)
+{
+	struct stat fs;
+	if(stat(dir, &fs) == 0 && S_ISDIR(fs.st_mode))
+			return 1;
+	return 0;
+
+}
+
+void update_path(char *path, unsigned char oui)
+{
+	char tmp[32];
+	char hex[2];
+	sprintf(hex, "%02x", oui);
+	sprintf(tmp, "%s/%c%c", path, hex[0], hex[1]);
+	if(access(tmp, F_OK) == 0) {
+		strncpy(path, tmp, 32);
+		return;
+	}
+
+	sprintf(tmp, "%s/%cx", path, hex[0]);
+	if(access(tmp, F_OK) == 0) {
+		strncpy(path, tmp, 32);
+		return;
+	}
+
+	printf("Unexpected: not found corresponding oui file!\n");
+}
+
+void search_oui(char *file, unsigned char *oui, char *line)
+{
+	FILE *fp;
+	char match[16];
+	sprintf(match, "%02X-%02X-%02X", oui[0], oui[1], oui[2]);
+
+	printf("Search %s from %s\n", match, file);
+
+	if((fp = fopen(file, "r")) == NULL) {
+		perror("fopen");
+		exit(-1);
+	}
+
+	while(fgets(line, 64, fp)) {
+		if(strncmp(line, match, strlen("00-00-00")) == 0) {
+			line[strlen(line) - 1] = 0;
+			return;
+		}
+	}
+	line[0] = '\0';
+}
+
+void update_vendor(ds_device *new)
+{
+	unsigned char oui[3];
+	char path[32];
+	char line[64];
+#define OUI_PATH "/etc/config/mac_oui/"
+	memcpy(oui, &new->mac, 3);
+	sprintf(path, OUI_PATH"%02x/%02x/", oui[0], oui[1]);
+	if(is_valid_dir(path)) {
+		update_path(path, oui[2]);
+		goto search;
+	}
+	else {
+		sprintf(path, OUI_PATH"%02x/", oui[0]);
+		if(is_valid_dir(path)) {
+			update_path(path, oui[1]);
+			goto search;
+		}
+	}
+	sprintf(path, OUI_PATH);
+	update_path(path, oui[0]);
+
+search:
+	search_oui(path, oui, line);
+	if(line[0] != 0) {
+		strncpy(new->vendor, strchr(line, ' ') + 1, sizeof(new->vendor) );
+		new->vendor[63] = 0;
+	}
+	else
+		strncpy(new->vendor, "Unknown", sizeof (new->vendor));
+}
+
 void insert_new_device(int key, ds_device * new)
 {
 	ds_device *dp;
@@ -87,6 +173,9 @@ void insert_new_device(int key, ds_device * new)
 		}
 		dp = dp->next;
 	}
+	/* In light of effeciency, only do actions below in new insertions */
+	update_vendor(new);
+
 	new->next = devices[key];
 	devices[key] = new;
 	printf("successfully inserted one iterm!\n");
@@ -129,6 +218,7 @@ void init_socket()
 		exit(-1);
 	}
 	strncpy(ifr.ifr_name, WAN, sizeof WAN);
+
 	/* read the MAC and IP for sending ARP requiest later */
 	if(ioctl(sock_arp, SIOCGIFHWADDR, &ifr) < 0) {
 		perror("ioctl");
@@ -214,7 +304,7 @@ void print_devices(int signal)
 
 	ds_device *dp = NULL;
 	printf("================== devices ================ \n");
-	printf("%-16s\t%-18s\t%-16s\t%s\n", "Device", "MAC", "IP", "Update time");
+	printf("%-16s %-18s %-16s %-12s %-28s %s\n", "Device", "MAC", "IP", "Status", "Update time", "Vendor");
 	for(i = 0; i < 256; i ++) {
 
 		char name[16];
@@ -236,8 +326,9 @@ void print_devices(int signal)
 			ether_ntoa_r(&dp->mac, mac);
 			strncpy(ip, inet_ntoa(dp->ip), sizeof ip);
 			strncpy(utime, ctime(&dp->update), sizeof utime);
+			strpnl(utime);
 
-			printf("%-16s\t%-18s\t%-16s\t%s\n", name, mac, ip, utime);
+			printf("%-16s %-18s %-16s %-12s %-28s %s\n", name, mac, ip, dp->live ? "Connected": "Disconnected", utime, dp->vendor);
 			dp = dp->next;
 		}
 
@@ -276,6 +367,7 @@ void renew(int signal)
 	for (i = 0; i < 256; i++) {
 		dp = devices[i];
 		while (dp) {
+			dp->live = 0;
 			send_arp(dp);
 			dp = dp->next;
 		}
@@ -284,7 +376,7 @@ void renew(int signal)
 
 int main(int argc, char *argv[])
 {
-	char c;
+	int c;
 	struct in_addr dip;
 	struct ether_addr dmac;
 	char dhost[128]; char *optstr="m:i:h:l";
@@ -294,6 +386,10 @@ int main(int argc, char *argv[])
 	if ( access(PID_FILE, F_OK) == 0) {
 
 		duplicate = 1;
+		if(argc == 1) {
+			printf("devscan daemon already exists.\n");
+			exit(-1);
+		}
 
 		FILE *fp = fopen(PID_FILE, "r");
 		if(!fp){
@@ -325,7 +421,7 @@ int main(int argc, char *argv[])
 	}
 
 
-	while ((c = getopt(argc, argv, optstr)) != -1) {
+	while (duplicate && (c = getopt(argc, argv, optstr)) != -1) {
 
 		switch(c) {
 
@@ -357,6 +453,7 @@ int main(int argc, char *argv[])
 				exit(0);
 			default:
 				printf("optstring=\"m:i:h:l\"!\n");
+				sleep(5);
 				break;
 		}
 	}
